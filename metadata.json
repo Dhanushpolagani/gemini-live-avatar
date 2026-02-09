@@ -1,0 +1,8 @@
+{
+  "name": "Gemini Live Avatar",
+  "description": "A real-time, multimodal AI avatar assistant powered by Gemini Live API. It can see, hear, and speak to you.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
