@@ -3,25 +3,30 @@ import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } f
 import { ConnectionState } from '../types';
 import { createPcmBlob, base64ToUint8Array, decodeAudioData, arrayBufferToBase64 } from '../utils/audioUtils';
 import { FileSystemManager } from '../utils/fileSystem';
+import { CalendarManager } from '../utils/calendarSystem';
 
-const SYSTEM_INSTRUCTION = `
+const BASE_SYSTEM_INSTRUCTION = `
 You are an advanced multimodal AI assistant embedded inside a real-time interactive AI avatar.
 
 CORE CAPABILITIES:
 - You can see and hear the user.
 - You have ACCESS to the user's local file system if they have mounted a workspace.
-- You can LIST, READ, and WRITE files to this workspace using the provided tools.
-- If the user asks you to write code, ALWAYS try to write it directly to a file using the 'writeFile' tool.
-- If the user asks about files, list them first to see what's there.
+- You have ACCESS to a CALENDAR system to schedule tasks and set reminders.
+- You have ACCESS to the WEB via a browser tool to open searches and websites.
 
 BEHAVIOR:
 - Be concise.
 - Output text is for the user's benefit: keep it relevant to their query.
 - If you perform a file operation, confirm it verbally ("I've saved the file").
+- When scheduling events, ensure you get a specific time from the user. 
+- You interpret "tomorrow", "in 5 minutes", etc., based on the CURRENT DATE AND TIME provided to you.
+- If the user asks to "search" for something, use the 'searchWeb' tool.
+- If the user asks to go to a specific site or "play X on YouTube", construct the appropriate URL and use 'openUrl'.
 `;
 
 // Define Tool Declarations with strict schemas
 const toolsConfig = [
+  // --- File System Tools ---
   {
     functionDeclarations: [
       {
@@ -30,11 +35,7 @@ const toolsConfig = [
         parameters: {
           type: Type.OBJECT,
           properties: {
-            // Adding a dummy property to avoid empty object schema issues which can cause "Network Error"
-            path: { 
-              type: Type.STRING, 
-              description: "Optional sub-path to list. Defaults to root." 
-            }
+             path: { type: Type.STRING, description: "Optional sub-path to list. Defaults to root." }
           }
         }
       },
@@ -59,6 +60,63 @@ const toolsConfig = [
             content: { type: Type.STRING, description: "The text content to write into the file" }
           },
           required: ["filename", "content"]
+        }
+      },
+      // --- Calendar Tools ---
+      {
+        name: "scheduleEvent",
+        description: "Schedule a reminder, alarm, or calendar event.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING, description: "Title of the event or task" },
+            time: { type: Type.STRING, description: "ISO 8601 date string (e.g., '2023-10-27T14:30:00'). Calculate this based on user's relative time request and current time." }
+          },
+          required: ["title", "time"]
+        }
+      },
+      {
+        name: "listEvents",
+        description: "List upcoming scheduled events and reminders.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+             dummy: { type: Type.STRING, description: "Unused" }
+          }
+        }
+      },
+      {
+        name: "deleteEvent",
+        description: "Delete an event by title or ID.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            identifier: { type: Type.STRING, description: "The title or ID of the event to delete" }
+          },
+          required: ["identifier"]
+        }
+      },
+      // --- Browser Tools ---
+      {
+        name: "searchWeb",
+        description: "Search Google for a query. Use this when the user asks to search for something.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: { type: Type.STRING, description: "The search query (e.g., 'weather in Tokyo')" }
+          },
+          required: ["query"]
+        }
+      },
+      {
+        name: "openUrl",
+        description: "Open a specific URL in the browser. Use this to navigate to websites.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            url: { type: Type.STRING, description: "The full URL (e.g., 'https://www.youtube.com')" }
+          },
+          required: ["url"]
         }
       }
     ]
@@ -93,6 +151,7 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
   const sessionRef = useRef<LiveSession | null>(null);
   const videoIntervalRef = useRef<number | null>(null);
   const fileSystemManager = useRef(new FileSystemManager());
+  const calendarManager = useRef(new CalendarManager());
 
   const mountDirectory = useCallback(async () => {
     setError(null);
@@ -107,11 +166,11 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
         return true;
     } catch (e: any) {
         console.error("Failed to mount directory:", e);
-        if (e.name === 'AbortError') return false; 
+        if (e.name === 'AbortError') return false; // User cancelled
         
-        // Handle SecurityError (iframe restrictions) & specific messages
+        // Handle iframe restrictions (SecurityError or specific message)
         if (e.name === 'SecurityError' || e.message?.includes("Cross origin sub frames") || e.message?.includes("security")) {
-             setError("File access is blocked in this preview environment. Please open the app in a new tab/window to use file features.");
+             setError("Access Denied: Browser security blocks file access in this preview window. Please open the app in a new tab.");
         } else {
              setError(e.message || "Failed to mount directory");
         }
@@ -129,15 +188,11 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
       inputSourceRef.current = null;
     }
     if (inputAudioContextRef.current) {
-      if (inputAudioContextRef.current.state !== 'closed') {
-          inputAudioContextRef.current.close();
-      }
+      inputAudioContextRef.current.close();
       inputAudioContextRef.current = null;
     }
     if (outputAudioContextRef.current) {
-      if (outputAudioContextRef.current.state !== 'closed') {
-          outputAudioContextRef.current.close();
-      }
+      outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
     if (videoIntervalRef.current) {
@@ -154,7 +209,7 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
     if (sessionRef.current) {
        try {
            const session = sessionRef.current;
-           sessionRef.current = null; 
+           sessionRef.current = null; // Guard against re-entry
            await session.close();
        } catch (e) {
            console.warn("Error closing session", e);
@@ -171,6 +226,7 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
       return;
     }
 
+    // Ensure strict cleanup before reconnecting
     if (sessionRef.current) {
         await disconnect();
     }
@@ -178,99 +234,115 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
     setConnectionState(ConnectionState.CONNECTING);
     setError(null);
 
+    // Request notification permission for calendar
+    calendarManager.current.requestPermission();
+
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      const config: any = {
-          responseModalities: [Modality.AUDIO], 
-          systemInstruction: SYSTEM_INSTRUCTION, 
-          speechConfig: {
-             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-          },
-      };
+      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      
+      analyserRef.current = outputAudioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      outputGainRef.current = outputAudioContextRef.current.createGain();
+      outputGainRef.current.connect(analyserRef.current);
+      analyserRef.current.connect(outputAudioContextRef.current.destination);
 
-      config.tools = toolsConfig;
+      const updateVolume = () => {
+        if (!analyserRef.current || connectionState === ConnectionState.DISCONNECTED) return;
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(dataArray);
+        
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        const normalizedVolume = Math.min(1, average / 128); 
+        onAudioData(normalizedVolume);
+        requestAnimationFrame(updateVolume);
+      };
+      requestAnimationFrame(updateVolume);
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Inject current time into system instruction
+      const currentTime = new Date().toLocaleString();
+      const dynamicSystemInstruction = `${BASE_SYSTEM_INSTRUCTION}\nCURRENT SYSTEM DATE/TIME: ${currentTime}`;
 
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-        config: config,
+        config: {
+          responseModalities: [Modality.AUDIO], 
+          systemInstruction: dynamicSystemInstruction, 
+          speechConfig: {
+             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+          },
+          // Enable input transcription to detect commands like "Bye"
+          inputAudioTranscription: {},
+          tools: toolsConfig,
+        },
         callbacks: {
           onopen: () => {
             console.log("Gemini Live Session Opened");
             setConnectionState(ConnectionState.CONNECTED);
 
-            // Initialize Audio Contexts only after success to avoid resource locking on failure
-            inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-            outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-            
-            analyserRef.current = outputAudioContextRef.current.createAnalyser();
-            analyserRef.current.fftSize = 256;
-            outputGainRef.current = outputAudioContextRef.current.createGain();
-            outputGainRef.current.connect(analyserRef.current);
-            analyserRef.current.connect(outputAudioContextRef.current.destination);
+            if (!inputAudioContextRef.current) return;
+            inputAudioContextRef.current.resume();
 
-            const updateVolume = () => {
-                if (!analyserRef.current || !sessionRef.current) return;
-                const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
-                analyserRef.current.getByteFrequencyData(dataArray);
+            // Delay audio streaming slightly to ensure connection stability
+            setTimeout(() => {
+                if (!inputAudioContextRef.current) return;
                 
-                let sum = 0;
-                for (let i = 0; i < dataArray.length; i++) {
-                  sum += dataArray[i];
-                }
-                const average = sum / dataArray.length;
-                const normalizedVolume = Math.min(1, average / 128); 
-                onAudioData(normalizedVolume);
-                requestAnimationFrame(updateVolume);
-            };
-            requestAnimationFrame(updateVolume);
-
-            // Start Input Stream
-            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-                 if (!inputAudioContextRef.current) return;
-                 inputSourceRef.current = inputAudioContextRef.current.createMediaStreamSource(stream);
-                 processorRef.current = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
-                 
-                 processorRef.current.onaudioprocess = (e) => {
-                   const inputData = e.inputBuffer.getChannelData(0);
-                   const pcmBlob = createPcmBlob(inputData);
-                   // Ensure session is still active and valid before sending
-                   sessionPromise.then(session => {
-                       if (sessionRef.current === session) {
-                           session.sendRealtimeInput({ media: pcmBlob });
-                       }
-                   }).catch(err => console.debug("Skipping input send, session not ready"));
-                 };
-     
-                 inputSourceRef.current.connect(processorRef.current);
-                 processorRef.current.connect(inputAudioContextRef.current.destination);
-            });
-
-            // Start Video Stream
-            if (videoElement) {
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                const FPS = 2; 
-                videoIntervalRef.current = window.setInterval(() => {
-                    if (!ctx || !videoElement.videoWidth) return;
-                    canvas.width = videoElement.videoWidth * 0.25; 
-                    canvas.height = videoElement.videoHeight * 0.25;
-                    ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-                    
-                    const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
-                    sessionPromise.then(session => {
-                        if (sessionRef.current === session) {
+                inputSourceRef.current = inputAudioContextRef.current.createMediaStreamSource(stream);
+                processorRef.current = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
+                
+                processorRef.current.onaudioprocess = (e) => {
+                  const inputData = e.inputBuffer.getChannelData(0);
+                  const pcmBlob = createPcmBlob(inputData);
+                  sessionPromise.then(session => {
+                      session.sendRealtimeInput({ media: pcmBlob });
+                  });
+                };
+    
+                inputSourceRef.current.connect(processorRef.current);
+                processorRef.current.connect(inputAudioContextRef.current.destination);
+    
+                if (videoElement) {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    const FPS = 2; 
+                    videoIntervalRef.current = window.setInterval(() => {
+                        if (!ctx || !videoElement.videoWidth) return;
+                        canvas.width = videoElement.videoWidth * 0.25; 
+                        canvas.height = videoElement.videoHeight * 0.25;
+                        ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                        
+                        const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
+                        sessionPromise.then(session => {
                             session.sendRealtimeInput({ media: { mimeType: 'image/jpeg', data: base64 } });
-                        }
-                    }).catch(err => console.debug("Skipping video send"));
-                }, 1000 / FPS);
-            }
+                        });
+                    }, 1000 / FPS);
+                }
+            }, 100);
           },
           onmessage: async (message: LiveServerMessage) => {
+             // Handle Output Transcription
              if (message.serverContent?.outputTranscription?.text) {
                  setTranscript(prev => prev + message.serverContent.outputTranscription.text);
              }
 
+             // Handle Input Transcription
+             if (message.serverContent?.inputTranscription?.text) {
+                 const text = message.serverContent.inputTranscription.text.trim();
+                 if (text.toLowerCase().includes("bye")) {
+                     disconnect();
+                     return;
+                 }
+             }
+
+             // Handle Tool Calls
              if (message.toolCall) {
                 console.log("Tool Call Received:", message.toolCall);
                 const session = await sessionPromise;
@@ -278,8 +350,8 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                 for (const fc of message.toolCall.functionCalls) {
                     let result = "Unknown Error";
                     try {
+                        // --- File System ---
                         if (fc.name === "listFiles") {
-                            // Arg 'path' is ignored as per current simple implementation
                             const files = await fileSystemManager.current.listFiles();
                             result = JSON.stringify(files);
                         } else if (fc.name === "readFile") {
@@ -288,8 +360,36 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                         } else if (fc.name === "writeFile") {
                             const args = fc.args as any;
                             result = await fileSystemManager.current.writeFile(args.filename, args.content);
-                            setTranscript(prev => prev + `\n\n[System] Wrote to file: ${args.filename}\n`);
-                        } else {
+                            setTranscript(prev => prev + `\n[System] Wrote to file: ${args.filename}\n`);
+                        } 
+                        // --- Calendar ---
+                        else if (fc.name === "scheduleEvent") {
+                            const args = fc.args as any;
+                            result = await calendarManager.current.scheduleEvent(args.title, args.time);
+                            setTranscript(prev => prev + `\n[Calendar] Scheduled: ${args.title} at ${args.time}\n`);
+                        } else if (fc.name === "listEvents") {
+                            result = await calendarManager.current.listEvents();
+                        } else if (fc.name === "deleteEvent") {
+                            const args = fc.args as any;
+                            result = await calendarManager.current.deleteEvent(args.identifier);
+                        }
+                        // --- Browser ---
+                        else if (fc.name === "searchWeb") {
+                            const args = fc.args as any;
+                            const query = args.query;
+                            const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+                            const win = window.open(url, '_blank');
+                            result = win ? `Opened search for "${query}"` : `Browser blocked popup for search: ${url}`;
+                            setTranscript(prev => prev + `\n[Browser] Opening Search: ${query}\n`);
+                        }
+                        else if (fc.name === "openUrl") {
+                            const args = fc.args as any;
+                            const url = args.url;
+                            const win = window.open(url, '_blank');
+                            result = win ? `Opened URL: ${url}` : `Browser blocked popup for URL: ${url}`;
+                            setTranscript(prev => prev + `\n[Browser] Opening URL: ${url}\n`);
+                        }
+                        else {
                             result = "Function not found";
                         }
                     } catch (e: any) {
@@ -306,6 +406,7 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                 }
              }
 
+             // Handle Audio Output
              const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
              if (base64Audio && outputAudioContextRef.current && outputGainRef.current) {
                 const ctx = outputAudioContextRef.current;
@@ -337,13 +438,14 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                  setTranscript("");
              }
           },
-          onclose: (e) => {
-            console.log("Session Closed", e);
+          onclose: () => {
+            console.log("Session Closed");
             disconnect();
           },
           onerror: (err) => {
             console.error("Session Error", err);
-            setError("Connection error. Please try again.");
+            if (connectionState === ConnectionState.DISCONNECTED) return;
+            setError("Connection error. The session was interrupted.");
             disconnect();
           }
         }
