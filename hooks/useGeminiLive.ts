@@ -12,7 +12,7 @@ CORE CAPABILITIES:
 - You can see and hear the user.
 - You have ACCESS to the user's local file system if they have mounted a workspace.
 - You have ACCESS to a CALENDAR system to schedule tasks and set reminders.
-- You have ACCESS to the WEB via a browser tool to open searches and websites.
+- You have ACCESS to the WEB via browser tools to open searches, websites, and find products.
 
 BEHAVIOR:
 - Be concise.
@@ -20,8 +20,15 @@ BEHAVIOR:
 - If you perform a file operation, confirm it verbally ("I've saved the file").
 - When scheduling events, ensure you get a specific time from the user. 
 - You interpret "tomorrow", "in 5 minutes", etc., based on the CURRENT DATE AND TIME provided to you.
-- If the user asks to "search" for something, use the 'searchWeb' tool.
-- If the user asks to go to a specific site or "play X on YouTube", construct the appropriate URL and use 'openUrl'.
+- WEB NAVIGATION & SHOPPING:
+  - If the user wants to "buy", "order", or "shop" for an item, use 'findProduct'.
+  - If the user asks to "search" for information, use 'searchWeb'.
+  - If the user asks to open a specific site (like YouTube, Twitter), use 'openUrl'.
+  - IMPORTANT: You cannot scroll or control external websites (like Amazon) after opening them due to browser security.
+  - If the user asks to "scroll down" or "scroll up" after opening a site, assume they mean the LOCAL chat transcript or dashboard and use 'controlScreen'.
+- CONTINUOUS LISTENING:
+  - You remain active even after opening a new tab. 
+  - If the user gives a follow-up command (e.g., "actually, search for blue ones instead"), use the context of the previous tool call to refine the new search.
 `;
 
 // Define Tool Declarations with strict schemas
@@ -99,7 +106,7 @@ const toolsConfig = [
       // --- Browser Tools ---
       {
         name: "searchWeb",
-        description: "Search Google for a query. Use this when the user asks to search for something.",
+        description: "Search Google for a query. Use this for general information.",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -117,6 +124,30 @@ const toolsConfig = [
             url: { type: Type.STRING, description: "The full URL (e.g., 'https://www.youtube.com')" }
           },
           required: ["url"]
+        }
+      },
+      {
+        name: "findProduct",
+        description: "Find a product to buy on e-commerce sites. Use this when the user wants to 'buy', 'order', or 'shop'.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            product: { type: Type.STRING, description: "The product to find (e.g., 'running shoes')" },
+            site: { type: Type.STRING, description: "Preferred site (e.g., 'amazon', 'ebay', 'walmart'). Defaults to Amazon." }
+          },
+          required: ["product"]
+        }
+      },
+      // --- UI Control Tools ---
+      {
+        name: "controlScreen",
+        description: "Scroll the application screen or chat transcript up or down.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            action: { type: Type.STRING, description: "The action to perform: 'scroll_up', 'scroll_down', 'top', 'bottom'." }
+          },
+          required: ["action"]
         }
       }
     ]
@@ -165,12 +196,17 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
         setIsFileSystemReady(true);
         return true;
     } catch (e: any) {
-        console.error("Failed to mount directory:", e);
         if (e.name === 'AbortError') return false; // User cancelled
         
-        // Handle iframe restrictions (SecurityError or specific message)
-        if (e.name === 'SecurityError' || e.message?.includes("Cross origin sub frames") || e.message?.includes("security")) {
-             setError("Access Denied: Browser security blocks file access in this preview window. Please open the app in a new tab.");
+        const isSecurityError = e.name === 'SecurityError' || e.message?.includes("Cross origin") || e.message?.includes("security");
+        
+        // Only log if it's NOT a known security/restriction error to keep console clean
+        if (!isSecurityError) {
+             console.error("Failed to mount directory:", e);
+        }
+        
+        if (isSecurityError) {
+             setError("Preview Mode: File access is restricted by the browser in this window. Open in a new tab to use this feature.");
         } else {
              setError(e.message || "Failed to mount directory");
         }
@@ -265,8 +301,15 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
       };
       requestAnimationFrame(updateVolume);
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
+      // --- AUDIO STREAM SETUP ---
+      // We request audio specifically. If this fails, the whole session fails.
+      let stream: MediaStream;
+      try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e: any) {
+          throw e; // Rethrow to be caught by outer block with specific error handling
+      }
+
       // Inject current time into system instruction
       const currentTime = new Date().toLocaleString();
       const dynamicSystemInstruction = `${BASE_SYSTEM_INSTRUCTION}\nCURRENT SYSTEM DATE/TIME: ${currentTime}`;
@@ -314,6 +357,7 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                     const ctx = canvas.getContext('2d');
                     const FPS = 2; 
                     videoIntervalRef.current = window.setInterval(() => {
+                        // Safe check for video dimensions - if camera failed, width is 0
                         if (!ctx || !videoElement.videoWidth) return;
                         canvas.width = videoElement.videoWidth * 0.25; 
                         canvas.height = videoElement.videoHeight * 0.25;
@@ -389,6 +433,31 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
                             result = win ? `Opened URL: ${url}` : `Browser blocked popup for URL: ${url}`;
                             setTranscript(prev => prev + `\n[Browser] Opening URL: ${url}\n`);
                         }
+                        else if (fc.name === "findProduct") {
+                            const args = fc.args as any;
+                            const product = args.product;
+                            const site = (args.site || 'amazon').toLowerCase();
+                            
+                            let url = '';
+                            if (site.includes('ebay')) {
+                                url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(product)}`;
+                            } else if (site.includes('walmart')) {
+                                url = `https://www.walmart.com/search?q=${encodeURIComponent(product)}`;
+                            } else {
+                                // Default to Amazon
+                                url = `https://www.amazon.com/s?k=${encodeURIComponent(product)}`;
+                            }
+                            
+                            const win = window.open(url, '_blank');
+                            result = win ? `Opened ${site} for ${product}` : `Browser blocked popup for ${site}`;
+                            setTranscript(prev => prev + `\n[Shopping] Opening ${site}: ${product}\n`);
+                        }
+                        // --- Screen Control ---
+                        else if (fc.name === "controlScreen") {
+                            const args = fc.args as any;
+                            window.dispatchEvent(new CustomEvent('gemini:scroll', { detail: args }));
+                            result = `Executed scroll action: ${args.action}`;
+                        }
                         else {
                             result = "Function not found";
                         }
@@ -455,7 +524,17 @@ export function useGeminiLive({ onAudioData }: UseGeminiLiveProps) {
 
     } catch (e: any) {
       console.error(e);
-      setError(e.message || "Failed to connect");
+      // Enhanced Error Handling for Permissions
+      let msg = e.message || "Failed to connect";
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          msg = "Microphone access denied. Please allow audio permissions in your browser settings.";
+      } else if (e.name === 'NotFoundError') {
+          msg = "No microphone found. Please connect an audio input device.";
+      } else if (e.name === 'NotReadableError') {
+          msg = "Microphone is busy or inaccessible.";
+      }
+
+      setError(msg);
       setConnectionState(ConnectionState.ERROR);
       disconnect();
     }

@@ -16,6 +16,7 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
   const [showControls, setShowControls] = useState(true);
   const controlsTimeoutRef = useRef<number | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
   
   // Memoize to prevent frequent re-renders causing hook dependency changes
   const handleAudioData = useCallback((vol: number) => {
@@ -35,6 +36,35 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
           Notification.requestPermission();
       }
   }, []);
+
+  // Handle Remote Scroll Events from Gemini
+  useEffect(() => {
+      const handleScrollEvent = (e: any) => {
+          const { action } = e.detail;
+          const container = chatContainerRef.current;
+          if (!container) return;
+
+          // Open chat if closed so user can see scrolling
+          if (!isChatOpen) setIsChatOpen(true);
+
+          const amount = 400; // Pixels to scroll
+          
+          if (action === 'scroll_up') {
+              container.scrollBy({ top: -amount, behavior: 'smooth' });
+          } else if (action === 'scroll_down') {
+              container.scrollBy({ top: amount, behavior: 'smooth' });
+          } else if (action === 'top') {
+              container.scrollTo({ top: 0, behavior: 'smooth' });
+          } else if (action === 'bottom') {
+              container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+          }
+      };
+
+      window.addEventListener('gemini:scroll', handleScrollEvent);
+      return () => {
+          window.removeEventListener('gemini:scroll', handleScrollEvent);
+      };
+  }, [isChatOpen]);
 
   // Auto-open chat when transcript updates
   useEffect(() => {
@@ -183,7 +213,10 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
                 </div>
                 
                 {/* Chat Content */}
-                <div className="flex-1 p-6 overflow-y-auto font-mono text-sm leading-relaxed text-slate-300 space-y-4 custom-scrollbar">
+                <div 
+                    ref={chatContainerRef}
+                    className="flex-1 p-6 overflow-y-auto font-mono text-sm leading-relaxed text-slate-300 space-y-4 custom-scrollbar scroll-smooth"
+                >
                     {transcript ? (
                         <div className="whitespace-pre-wrap animate-in fade-in duration-500">
                             {transcript}
